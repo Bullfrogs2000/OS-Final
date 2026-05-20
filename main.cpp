@@ -81,10 +81,19 @@ static unsigned long long totalCpuJiffies() {
 static unsigned long long procJiffies(int pid) {
     std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
     if (!f) return 0;
+    std::string line;
+    if (!std::getline(f, line)) return 0;
+    // Field 2 is comm in parens e.g. "(my proc name)" and can contain spaces.
+    // Find the last ')' to skip it reliably.
+    std::size_t rparen = line.rfind(')');
+    if (rparen == std::string::npos) return 0;
+    // After the closing paren: fields 3..13 are single tokens (skip 11 more),
+    // then field 14 = utime, field 15 = stime.
+    std::istringstream ss(line.substr(rparen + 1));
     std::string tok;
-    for (int i = 1; i <= 13; ++i) f >> tok;   // skip fields 1-13
-    unsigned long long utime, stime;
-    f >> utime >> stime;
+    for (int i = 3; i <= 13; ++i) if (!(ss >> tok)) return 0;
+    unsigned long long utime = 0, stime = 0;
+    if (!(ss >> utime >> stime)) return 0;
     return utime + stime;
 }
 
@@ -194,6 +203,11 @@ static void drawHLine(SDL_Renderer *r, int x1, int x2, int y, SDL_Color c) {
     SDL_RenderDrawLine(r, x1, y, x2, y);
 }
 
+static void drawVLine(SDL_Renderer *r, int x, int y1, int y2, SDL_Color c) {
+    setColor(r, c);
+    SDL_RenderDrawLine(r, x, y1, x, y2);
+}
+
 // Render text -> texture (caller frees)
 static SDL_Texture *makeText(SDL_Renderer *r, TTF_Font *f,
                              const std::string &s, SDL_Color c) {
@@ -274,12 +288,13 @@ int main() {
         nullptr
     };
     TTF_Font *fontSm = nullptr, *fontMd = nullptr, *fontLg = nullptr;
-    for (int i = 0; fontPaths[i] && !fontSm; ++i) {
-        fontSm = tryFont(fontPaths[i], 13);
-        fontMd = tryFont(fontPaths[i], 15);
-        fontLg = tryFont(fontPaths[i], 22);
+    for (int i = 0; fontPaths[i]; ++i) {
+        if (!fontSm) fontSm = tryFont(fontPaths[i], 13);
+        if (!fontMd) fontMd = tryFont(fontPaths[i], 15);
+        if (!fontLg) fontLg = tryFont(fontPaths[i], 22);
+        if (fontSm && fontMd && fontLg) break;
     }
-    if (!fontSm) {
+    if (!fontSm || !fontMd || !fontLg) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
             "Font missing",
             "Could not find a monospace font. Install fonts-dejavu-core.",
@@ -341,16 +356,17 @@ int main() {
     auto sortProcs = [&]() {
         std::sort(procs.begin(), procs.end(),
             [&](const ProcInfo &a, const ProcInfo &b) {
-                bool less = false;
+                // Must be strict weak order: if a==b, must return false.
+                // Use (b < a) for descending so equal elements return false.
                 switch (sortCol) {
-                    case SortCol::PID:   less = a.pid     < b.pid;     break;
-                    case SortCol::NAME:  less = a.name    < b.name;    break;
-                    case SortCol::CPU:   less = a.cpu_pct < b.cpu_pct; break;
-                    case SortCol::MEM:   less = a.mem_pct < b.mem_pct; break;
-                    case SortCol::READ:  less = a.read_kb < b.read_kb; break;
-                    case SortCol::WRITE: less = a.write_kb< b.write_kb;break;
+                    case SortCol::PID:   return sortAsc ? a.pid      < b.pid      : b.pid      < a.pid;
+                    case SortCol::NAME:  return sortAsc ? a.name     < b.name     : b.name     < a.name;
+                    case SortCol::CPU:   return sortAsc ? a.cpu_pct  < b.cpu_pct  : b.cpu_pct  < a.cpu_pct;
+                    case SortCol::MEM:   return sortAsc ? a.mem_pct  < b.mem_pct  : b.mem_pct  < a.mem_pct;
+                    case SortCol::READ:  return sortAsc ? a.read_kb  < b.read_kb  : b.read_kb  < a.read_kb;
+                    case SortCol::WRITE: return sortAsc ? a.write_kb < b.write_kb : b.write_kb < a.write_kb;
                 }
-                return sortAsc ? less : !less;
+                return false;
             });
     };
 
@@ -372,7 +388,7 @@ int main() {
             }
 
             if (ev.type == SDL_MOUSEMOTION) {
-                int mx = ev.motion.x, my = ev.motion.y;
+                int my = ev.motion.y;
                 int listTop = HEADER_H + COL_HDR_H;
                 int listBot = WIN_H - FOOTER_H;
                 if (my >= listTop && my < listBot) {
@@ -439,7 +455,7 @@ int main() {
             if (active) label += (sortAsc ? " ▲" : " ▼");
             drawText(ren, fontSm, label, lc, COLS[c].x + 2, HEADER_H + 8, COLS[c].w - 4);
             // column separator
-            if (c > 0) drawHLine(ren, COLS[c].x, COLS[c].x, HEADER_H, HEADER_H + COL_HDR_H, C_GRID);
+            if (c > 0) drawVLine(ren, COLS[c].x, HEADER_H, HEADER_H + COL_HDR_H, C_GRID);
         }
 
         // Clip list area (software clip via scissor)
@@ -537,9 +553,9 @@ int main() {
         SDL_Delay(16);  // ~60 fps render loop; data refreshed every REFRESH_MS
     }
 
-    TTF_CloseFont(fontSm);
-    TTF_CloseFont(fontMd);
-    TTF_CloseFont(fontLg);
+    if (fontSm) TTF_CloseFont(fontSm);
+    if (fontMd) TTF_CloseFont(fontMd);
+    if (fontLg) TTF_CloseFont(fontLg);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     TTF_Quit();
